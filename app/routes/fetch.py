@@ -14,6 +14,11 @@ logger = get_logger(__name__)
 router = APIRouter(tags=["tools"])
 
 
+def _is_html(content_type: str) -> bool:
+    ct = (content_type or "").lower()
+    return "html" in ct or "xml" in ct
+
+
 @router.post("/fetch_url", response_model=FetchResponse)
 async def fetch_url(
     payload: FetchRequest,
@@ -23,27 +28,20 @@ async def fetch_url(
 
     logger.info("fetch_url.request", extra={"url": url})
 
-    response = await fetch(url, max_bytes=settings.max_html_bytes)
+    result = await fetch(url, max_bytes=settings.max_html_bytes)
 
-    try:
-        html = response.text
-    except Exception:
-        html = response.content.decode("utf-8", errors="replace")
+    # Extract the title BEFORE truncation so cut HTML can't hide <title>.
+    title = extract_title(result.text) if _is_html(result.content_type) else ""
 
+    html = result.text
     if len(html) > settings.max_html_chars:
         html = html[: settings.max_html_chars]
 
-    content_type = response.headers.get("Content-Type", "").split(";")[0].strip()
-
-    title = ""
-    if "html" in (content_type or "").lower():
-        title = extract_title(html)
-
     return FetchResponse(
         url=payload.url,
-        final_url=str(response.url),
-        status_code=response.status_code,
-        content_type=content_type,
+        final_url=result.final_url,
+        status_code=result.status_code,
+        content_type=result.content_type,
         title=title,
         html=html,
     )

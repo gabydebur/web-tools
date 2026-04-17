@@ -1,6 +1,7 @@
 """Shared async HTTP client and fetch helper."""
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Optional
 
 import httpx
@@ -10,6 +11,21 @@ from app.utils.errors import PayloadTooLargeError, UpstreamError
 from app.utils.logging import get_logger
 
 logger = get_logger(__name__)
+
+
+@dataclass(slots=True, frozen=True)
+class FetchResult:
+    """Lightweight, self-contained result of a GET request.
+
+    Intentionally decoupled from httpx.Response so callers never depend on
+    the client's private / lifecycle-bound internals.
+    """
+
+    final_url: str
+    status_code: int
+    content_type: str
+    text: str
+    content: bytes
 
 
 _client: Optional[httpx.AsyncClient] = None
@@ -46,8 +62,8 @@ async def shutdown_http_client() -> None:
 def get_http_client() -> httpx.AsyncClient:
     """Return the lazily-initialized shared client.
 
-    Using a module-level singleton keeps things simple while still honoring
-    FastAPI lifespan events for clean shutdown.
+    Prefer relying on the FastAPI lifespan to own the lifecycle. This fallback
+    exists so out-of-app call sites (tests, scripts) still work.
     """
     global _client
     if _client is None:
@@ -55,8 +71,19 @@ def get_http_client() -> httpx.AsyncClient:
     return _client
 
 
-async def fetch(url: str, *, max_bytes: int) -> httpx.Response:
-    """Perform a GET request with size guard.
+def _decode(content: bytes, encoding: str | None) -> str:
+    for enc in (encoding, "utf-8", "latin-1"):
+        if not enc:
+            continue
+        try:
+            return content.decode(enc, errors="replace")
+        except LookupError:
+            continue
+    return content.decode("utf-8", errors="replace")
+
+
+async def fetch(url: str, *, max_bytes: int) -> FetchResult:
+    """Perform a GET request with a streaming size guard.
 
     Raises:
         UpstreamError: on network / HTTP / timeout failure.
@@ -66,7 +93,7 @@ async def fetch(url: str, *, max_bytes: int) -> httpx.Response:
 
     try:
         async with client.stream("GET", url) as response:
-            # Pre-check Content-Length when available
+            # Cheap pre-check when the server announces size
             cl = response.headers.get("Content-Length")
             if cl is not None:
                 try:
@@ -89,9 +116,18 @@ async def fetch(url: str, *, max_bytes: int) -> httpx.Response:
                     )
                 chunks.append(chunk)
 
-            # Attach the buffered content so callers can access `.content`/`.text`
-            response._content = b"".join(chunks)  # type: ignore[attr-defined]
-            return response
+            content = b"".join(chunks)
+            content_type = response.headers.get("Content-Type", "").split(";")[0].strip()
+            # `response.encoding` is derived from Content-Type charset when present.
+            text = _decode(content, response.encoding)
+
+            return FetchResult(
+                final_url=str(response.url),
+                status_code=response.status_code,
+                content_type=content_type,
+                text=text,
+                content=content,
+            )
 
     except PayloadTooLargeError:
         raise

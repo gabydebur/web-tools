@@ -4,14 +4,18 @@ from __future__ import annotations
 from typing import Any
 
 import httpx
+from pydantic import ValidationError
 
 from app.config import Settings
 from app.schemas import SearchResultItem
+from app.services.http_client import get_http_client
 from app.utils.errors import SearchBackendError
 from app.utils.logging import get_logger
-from app.services.http_client import get_http_client
 
 logger = get_logger(__name__)
+
+# Hard cap on the SearxNG JSON payload size we will read. Generous but bounded.
+_SEARXNG_MAX_BYTES = 2_000_000
 
 
 async def search(query: str, limit: int, settings: Settings) -> list[SearchResultItem]:
@@ -32,9 +36,21 @@ async def search(query: str, limit: int, settings: Settings) -> list[SearchResul
     client = get_http_client()
 
     try:
-        response = await client.get(endpoint, params=params)
-        response.raise_for_status()
-        payload: dict[str, Any] = response.json()
+        async with client.stream("GET", endpoint, params=params) as response:
+            response.raise_for_status()
+            chunks: list[bytes] = []
+            total = 0
+            async for chunk in response.aiter_bytes():
+                total += len(chunk)
+                if total > _SEARXNG_MAX_BYTES:
+                    raise SearchBackendError(
+                        "SearxNG response too large",
+                        detail=f"read={total} max={_SEARXNG_MAX_BYTES}",
+                    )
+                chunks.append(chunk)
+            body = b"".join(chunks)
+    except SearchBackendError:
+        raise
     except httpx.TimeoutException as exc:
         logger.warning("searxng.timeout", extra={"query": query})
         raise SearchBackendError("SearxNG timed out", detail=str(exc)) from exc
@@ -50,7 +66,12 @@ async def search(query: str, limit: int, settings: Settings) -> list[SearchResul
     except httpx.HTTPError as exc:
         logger.warning("searxng.http_error", extra={"query": query, "err": str(exc)})
         raise SearchBackendError("SearxNG request failed", detail=str(exc)) from exc
-    except ValueError as exc:
+
+    try:
+        import json as _json
+
+        payload: dict[str, Any] = _json.loads(body.decode("utf-8", errors="replace"))
+    except (ValueError, TypeError) as exc:
         raise SearchBackendError("SearxNG returned invalid JSON", detail=str(exc)) from exc
 
     raw_results = payload.get("results", [])
@@ -74,8 +95,8 @@ async def search(query: str, limit: int, settings: Settings) -> list[SearchResul
                     source=entry.get("engine") or None,
                 )
             )
-        except Exception:
-            # Ignore individual entries that fail URL validation
+        except ValidationError:
+            # Drop individual malformed entries (bad URL, wrong type, etc.)
             continue
         if len(items) >= limit:
             break

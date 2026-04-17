@@ -14,6 +14,16 @@ logger = get_logger(__name__)
 router = APIRouter(tags=["tools"])
 
 
+def _is_html(content_type: str) -> bool:
+    ct = (content_type or "").lower()
+    return "html" in ct or "xml" in ct
+
+
+def _is_plain_text(content_type: str) -> bool:
+    ct = (content_type or "").lower()
+    return ct.startswith("text/") and not _is_html(ct)
+
+
 @router.post("/extract_text", response_model=ExtractResponse)
 async def extract_text(
     payload: ExtractRequest,
@@ -23,19 +33,32 @@ async def extract_text(
 
     logger.info("extract_text.request", extra={"url": url})
 
-    response = await fetch(url, max_bytes=settings.max_html_bytes)
+    result = await fetch(url, max_bytes=settings.max_html_bytes)
 
-    try:
-        html = response.text
-    except Exception:
-        html = response.content.decode("utf-8", errors="replace")
+    title = ""
+    content = ""
 
-    extracted = extract_readable(html)
-    content = truncate(extracted.text, settings.max_text_chars)
+    if _is_html(result.content_type):
+        extracted = extract_readable(result.text)
+        title = extracted.title
+        content = extracted.text
+        # Fallback: readability sometimes returns empty text on poorly structured pages.
+        if not content:
+            content = result.text
+    elif _is_plain_text(result.content_type):
+        content = result.text
+    else:
+        # Non-text content (PDF, image, binary): no extraction.
+        logger.info(
+            "extract_text.skipped_non_text",
+            extra={"url": url, "content_type": result.content_type},
+        )
+
+    content = truncate(content, settings.max_text_chars)
 
     return ExtractResponse(
         url=payload.url,
-        final_url=str(response.url),
-        title=extracted.title,
+        final_url=result.final_url,
+        title=title,
         content=content,
     )

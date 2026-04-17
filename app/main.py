@@ -5,6 +5,7 @@ from contextlib import asynccontextmanager
 from typing import AsyncIterator
 
 from fastapi import FastAPI, Request
+from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
@@ -62,12 +63,14 @@ def create_app() -> FastAPI:
 
     @app.exception_handler(RequestValidationError)
     async def handle_validation(_: Request, exc: RequestValidationError) -> JSONResponse:
+        # Return the structured error list directly (not str()-stringified)
+        # so clients can parse field-level issues.
         return JSONResponse(
             status_code=422,
-            content=ErrorResponse(
-                error="validation_error",
-                detail=str(exc.errors()),
-            ).model_dump(),
+            content={
+                "error": "validation_error",
+                "detail": jsonable_encoder(exc.errors()),
+            },
         )
 
     @app.exception_handler(Exception)
