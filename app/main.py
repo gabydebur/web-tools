@@ -52,9 +52,11 @@ def create_app() -> FastAPI:
 
     @app.exception_handler(WebToolsError)
     async def handle_domain_error(_: Request, exc: WebToolsError) -> JSONResponse:
+        # Note: avoid "message" / "msg" / "args" keys in `extra`, they are
+        # reserved by logging.LogRecord and raise KeyError if overwritten.
         logger.warning(
             "request.domain_error",
-            extra={"code": exc.code, "message": exc.message, "detail": exc.detail},
+            extra={"code": exc.code, "err_msg": exc.message, "err_detail": exc.detail},
         )
         return JSONResponse(
             status_code=exc.status_code,
